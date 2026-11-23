@@ -38,39 +38,26 @@ def candle_to_lwc(candle):
     }
 
 
-async def fetch_historical(client: PocketOptionAsync, symbol: str):
-    """Fetch history from the server endpoint (matches broker chart)."""
-    try:
-        # get_candles_advanced pulls from loadHistoryPeriod (server data)
-        hist = await client.get_candles_advanced(
-            symbol, period=TIMEFRAME, offset=HISTORY_COUNT * TIMEFRAME, time=0
-        )
-        if hist:
-            converted = [candle_to_lwc(c) for c in hist[-HISTORY_COUNT:]]
-            candle_store[symbol] = converted
-            print(f"[{symbol}] backfilled {len(converted)} candles from server")
-            # Broadcast history to all connected clients
-            msg = json.dumps({"symbol": symbol, "history": converted})
-            for ws in subscribers[:]:
-                try:
-                    await ws.send_text(msg)
-                except Exception:
-                    if ws in subscribers:
-                        subscribers.remove(ws)
-        else:
-            print(f"[{symbol}] get_candles_advanced returned no data")
-    except Exception as e:
-        print(f"[{symbol}] backfill error: {e!r}")
-
-
 async def stream_symbol(client: PocketOptionAsync, symbol: str):
-    """Stream forming candle only; history is fetched separately."""
-    print(f"[{symbol}] starting live stream...")
+    """Use get_candles_live to receive both closed history and the forming candle."""
+    print(f"[{symbol}] starting get_candles_live stream...")
     try:
         async for closed_candles, forming_candle in client.get_candles_live(
-            symbol, period=TIMEFRAME, hours=0.5, max_rows=5
+            symbol, period=TIMEFRAME, hours=1.0, max_rows=HISTORY_COUNT
         ):
-            # Only use the forming candle for live updates; ignore compiled history
+            # Update historical closed candles (keep last HISTORY_COUNT)
+            if closed_candles:
+                converted = [candle_to_lwc(c) for c in closed_candles[-HISTORY_COUNT:]]
+                candle_store[symbol] = converted
+                msg = json.dumps({"symbol": symbol, "history": converted})
+                for ws in subscribers[:]:
+                    try:
+                        await ws.send_text(msg)
+                    except Exception:
+                        if ws in subscribers:
+                            subscribers.remove(ws)
+
+            # Broadcast the forming candle (live update)
             if forming_candle:
                 lwc = candle_to_lwc(forming_candle)
                 msg = json.dumps({"symbol": symbol, "candle": lwc})
@@ -80,7 +67,9 @@ async def stream_symbol(client: PocketOptionAsync, symbol: str):
                     except Exception:
                         if ws in subscribers:
                             subscribers.remove(ws)
-            await asyncio.sleep(0.1)
+
+            await asyncio.sleep(0.05)
+
     except Exception as e:
         print(f"[{symbol}] stream error: {e!r}")
 
@@ -88,14 +77,12 @@ async def stream_symbol(client: PocketOptionAsync, symbol: str):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if not SSID:
-        raise RuntimeError("POCKET_OPTION_SSID not set")
+        raise RuntimeError("POCKET_OPTION_SSID environment variable is not set")
     client = PocketOptionAsync(SSID)
     await asyncio.sleep(5)
 
-    # Fetch server history first, then start live streams
-    await asyncio.gather(*[fetch_historical(client, s) for s in SYMBOLS])
     tasks = [asyncio.create_task(stream_symbol(client, s)) for s in SYMBOLS]
-    print("[lifespan] tasks started")
+    print("[lifespan] stream tasks started")
     yield
     for t in tasks:
         t.cancel()
@@ -120,7 +107,10 @@ async def ws_endpoint(ws: WebSocket):
     subscribers.append(ws)
     try:
         for symbol, candles in candle_store.items():
-            await ws.send_text(json.dumps({"symbol": symbol, "history": candles[-HISTORY_COUNT:]}))
+            await ws.send_text(json.dumps({
+                "symbol": symbol,
+                "history": candles[-HISTORY_COUNT:]
+            }))
         while True:
             await ws.receive_text()
     except WebSocketDisconnect:
