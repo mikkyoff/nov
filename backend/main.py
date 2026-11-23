@@ -11,24 +11,20 @@ from BinaryOptionsToolsV2.pocketoption import PocketOptionAsync
 
 SSID = os.environ.get("POCKET_OPTION_SSID")
 SYMBOLS = ["EURHUF_otc", "EURUSD_otc"]
-TIMEFRAME = 15          # 15-second period
-HISTORY_COUNT = 99      # backfill 99 historical candles
-MAX_KEEP = 500          # cap candles kept in memory per symbol
+TIMEFRAME = 15
+HISTORY_COUNT = 99
 
-# In-memory candle store: { symbol: [candle_dict, ...] }
 candle_store = {s: [] for s in SYMBOLS}
 subscribers: list[WebSocket] = []
 
 
 def candle_to_lwc(candle):
-    """Convert a candle dict from the library into Lightweight Charts format."""
     t = candle.get("time")
     if isinstance(t, str):
         try:
             dt = datetime.fromisoformat(t.replace("Z", "+00:00"))
             epoch = int(dt.timestamp())
         except ValueError:
-            # Handles "2024-01-01 10:00:00" style timestamps
             dt = datetime.strptime(t, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
             epoch = int(dt.timestamp())
     else:
@@ -42,26 +38,39 @@ def candle_to_lwc(candle):
     }
 
 
+async def fetch_historical(client: PocketOptionAsync, symbol: str):
+    """Fetch history from the server endpoint (matches broker chart)."""
+    try:
+        # get_candles_advanced pulls from loadHistoryPeriod (server data)
+        hist = await client.get_candles_advanced(
+            symbol, period=TIMEFRAME, offset=HISTORY_COUNT * TIMEFRAME, time=0
+        )
+        if hist:
+            converted = [candle_to_lwc(c) for c in hist[-HISTORY_COUNT:]]
+            candle_store[symbol] = converted
+            print(f"[{symbol}] backfilled {len(converted)} candles from server")
+            # Broadcast history to all connected clients
+            msg = json.dumps({"symbol": symbol, "history": converted})
+            for ws in subscribers[:]:
+                try:
+                    await ws.send_text(msg)
+                except Exception:
+                    if ws in subscribers:
+                        subscribers.remove(ws)
+        else:
+            print(f"[{symbol}] get_candles_advanced returned no data")
+    except Exception as e:
+        print(f"[{symbol}] backfill error: {e!r}")
+
+
 async def stream_symbol(client: PocketOptionAsync, symbol: str):
-    """Use get_candles_live to receive both closed history and the forming candle."""
-    print(f"[{symbol}] starting data stream...")
+    """Stream forming candle only; history is fetched separately."""
+    print(f"[{symbol}] starting live stream...")
     try:
         async for closed_candles, forming_candle in client.get_candles_live(
-            symbol, period=TIMEFRAME, hours=2.0, max_rows=HISTORY_COUNT
+            symbol, period=TIMEFRAME, hours=0.5, max_rows=5
         ):
-            # 1. Update historical closed candles (keep only the last HISTORY_COUNT)
-            if closed_candles:
-                converted = [candle_to_lwc(c) for c in closed_candles[-HISTORY_COUNT:]]
-                candle_store[symbol] = converted
-                msg = json.dumps({"symbol": symbol, "history": converted})
-                for ws in subscribers[:]:
-                    try:
-                        await ws.send_text(msg)
-                    except Exception:
-                        if ws in subscribers:
-                            subscribers.remove(ws)
-
-            # 2. Broadcast the currently forming candle (live update)
+            # Only use the forming candle for live updates; ignore compiled history
             if forming_candle:
                 lwc = candle_to_lwc(forming_candle)
                 msg = json.dumps({"symbol": symbol, "candle": lwc})
@@ -71,10 +80,7 @@ async def stream_symbol(client: PocketOptionAsync, symbol: str):
                     except Exception:
                         if ws in subscribers:
                             subscribers.remove(ws)
-
-            # Yield to the event loop so the server stays responsive
             await asyncio.sleep(0.1)
-
     except Exception as e:
         print(f"[{symbol}] stream error: {e!r}")
 
@@ -82,17 +88,18 @@ async def stream_symbol(client: PocketOptionAsync, symbol: str):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if not SSID:
-        raise RuntimeError("POCKET_OPTION_SSID environment variable is not set")
+        raise RuntimeError("POCKET_OPTION_SSID not set")
     client = PocketOptionAsync(SSID)
-    # Give the client a moment to establish the connection
     await asyncio.sleep(5)
+
+    # Fetch server history first, then start live streams
+    await asyncio.gather(*[fetch_historical(client, s) for s in SYMBOLS])
     tasks = [asyncio.create_task(stream_symbol(client, s)) for s in SYMBOLS]
-    print("[lifespan] data stream tasks started")
+    print("[lifespan] tasks started")
     yield
     for t in tasks:
         t.cancel()
-    # PocketOptionAsync has no explicit __aexit__; let it be garbage collected.
-    print("[lifespan] shutting down")
+    print("[lifespan] shutdown")
 
 
 app = FastAPI(lifespan=lifespan)
@@ -100,7 +107,6 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/health")
 async def health():
-    """Health endpoint for Railway and for manual verification."""
     return JSONResponse({
         "status": "ok",
         "symbols": {s: len(candle_store[s]) for s in SYMBOLS},
@@ -113,12 +119,8 @@ async def ws_endpoint(ws: WebSocket):
     await ws.accept()
     subscribers.append(ws)
     try:
-        # Send whatever history is already in memory
         for symbol, candles in candle_store.items():
-            await ws.send_text(json.dumps({
-                "symbol": symbol,
-                "history": candles[-HISTORY_COUNT:]
-            }))
+            await ws.send_text(json.dumps({"symbol": symbol, "history": candles[-HISTORY_COUNT:]}))
         while True:
             await ws.receive_text()
     except WebSocketDisconnect:
@@ -126,5 +128,4 @@ async def ws_endpoint(ws: WebSocket):
             subscribers.remove(ws)
 
 
-# Mount the frontend (Dockerfile copies it to backend/frontend)
 app.mount("/", StaticFiles(directory="frontend", html=True), name="static")
