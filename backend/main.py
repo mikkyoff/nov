@@ -12,13 +12,14 @@ from BinaryOptionsToolsV2.pocketoption import PocketOptionAsync
 SSID = os.environ.get("POCKET_OPTION_SSID")
 SYMBOLS = ["EURHUF_otc", "EURUSD_otc"]
 TIMEFRAME = 15
-HISTORY_COUNT = 100
+HISTORY_COUNT = 10
 
 candle_store = {s: [] for s in SYMBOLS}
 subscribers: list[WebSocket] = []
 
 
 def candle_to_lwc(candle):
+    """Convert candle dict to Lightweight Charts format."""
     t = candle.get("time")
     if isinstance(t, str):
         try:
@@ -38,15 +39,20 @@ def candle_to_lwc(candle):
     }
 
 
-async def poll_historical(client: PocketOptionAsync):
-    """Poll the last 100 candles for both assets using candles_many."""
-    try:
-        feed = await client.candles_many(SYMBOLS, TIMEFRAME, count=HISTORY_COUNT)
-        for symbol, candles in feed.items():
+async def poll_closed_candles(client: PocketOptionAsync):
+    """Poll the last 10 closed candles for each asset using get_candles()."""
+    for symbol in SYMBOLS:
+        try:
+            # get_candles(asset, period, offset) - offset is lookback seconds
+            # For 15s candles, requesting 600s (10 * 15 * 4, extra buffer) 
+            # should return enough history
+            candles = await client.get_candles(symbol, TIMEFRAME, TIMEFRAME * HISTORY_COUNT * 4)
             if candles:
+                # Take only the last HISTORY_COUNT (10) closed candles
                 converted = [candle_to_lwc(c) for c in candles[-HISTORY_COUNT:]]
                 candle_store[symbol] = converted
-                print(f"[{symbol}] polled {len(converted)} candles")
+                print(f"[{symbol}] polled {len(converted)} closed candles")
+                # Broadcast to WebSocket clients
                 msg = json.dumps({"symbol": symbol, "history": converted})
                 for ws in subscribers[:]:
                     try:
@@ -55,30 +61,9 @@ async def poll_historical(client: PocketOptionAsync):
                         if ws in subscribers:
                             subscribers.remove(ws)
             else:
-                print(f"[{symbol}] candles_many returned empty")
-    except Exception as e:
-        print(f"[poll] candles_many error: {e!r}")
-
-
-async def stream_forming(client: PocketOptionAsync, symbol: str):
-    """Keep a lightweight stream just for the forming candle."""
-    print(f"[{symbol}] starting forming-candle stream...")
-    try:
-        async for closed, forming in client.get_candles_live(
-            symbol, period=TIMEFRAME, hours=0.1, max_rows=2
-        ):
-            if forming:
-                lwc = candle_to_lwc(forming)
-                msg = json.dumps({"symbol": symbol, "candle": lwc})
-                for ws in subscribers[:]:
-                    try:
-                        await ws.send_text(msg)
-                    except Exception:
-                        if ws in subscribers:
-                            subscribers.remove(ws)
-            await asyncio.sleep(0.1)
-    except Exception as e:
-        print(f"[{symbol}] forming stream error: {e!r}")
+                print(f"[{symbol}] get_candles returned empty")
+        except Exception as e:
+            print(f"[{symbol}] poll error: {e!r}")
 
 
 @asynccontextmanager
@@ -88,23 +73,19 @@ async def lifespan(app: FastAPI):
     client = PocketOptionAsync(SSID)
     await asyncio.sleep(5)
 
-    # Initial poll for history
-    await poll_historical(client)
+    # Initial poll
+    await poll_closed_candles(client)
 
-    # Start forming-candle streams (not for history, only for live updates)
-    tasks = [asyncio.create_task(stream_forming(client, s)) for s in SYMBOLS]
-
-    # Periodic re-poll every 30 seconds to keep history fresh
+    # Optional: re-poll every 30 seconds to keep the 10 candles fresh
     async def repoll():
         while True:
             await asyncio.sleep(30)
-            await poll_historical(client)
+            await poll_closed_candles(client)
 
-    tasks.append(asyncio.create_task(repoll()))
-    print("[lifespan] polling + streams started")
+    task = asyncio.create_task(repoll())
+    print("[lifespan] polling started")
     yield
-    for t in tasks:
-        t.cancel()
+    task.cancel()
     print("[lifespan] shutdown")
 
 
@@ -125,10 +106,11 @@ async def ws_endpoint(ws: WebSocket):
     await ws.accept()
     subscribers.append(ws)
     try:
+        # Send whatever history is already in memory
         for symbol, candles in candle_store.items():
             await ws.send_text(json.dumps({
                 "symbol": symbol,
-                "history": candles[-HISTORY_COUNT:]
+                "history": candles
             }))
         while True:
             await ws.receive_text()
