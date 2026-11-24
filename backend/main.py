@@ -12,7 +12,7 @@ from BinaryOptionsToolsV2.pocketoption import PocketOptionAsync
 SSID = os.environ.get("POCKET_OPTION_SSID")
 SYMBOLS = ["EURHUF_otc", "EURUSD_otc"]
 TIMEFRAME = 15
-HISTORY_COUNT = 99
+HISTORY_COUNT = 100
 
 candle_store = {s: [] for s in SYMBOLS}
 subscribers: list[WebSocket] = []
@@ -38,17 +38,15 @@ def candle_to_lwc(candle):
     }
 
 
-async def stream_symbol(client: PocketOptionAsync, symbol: str):
-    """Use get_candles_live to receive both closed history and the forming candle."""
-    print(f"[{symbol}] starting get_candles_live stream...")
+async def poll_historical(client: PocketOptionAsync):
+    """Poll the last 100 candles for both assets using candles_many."""
     try:
-        async for closed_candles, forming_candle in client.get_candles_live(
-            symbol, period=TIMEFRAME, hours=1.0, max_rows=HISTORY_COUNT
-        ):
-            # Update historical closed candles (keep last HISTORY_COUNT)
-            if closed_candles:
-                converted = [candle_to_lwc(c) for c in closed_candles[-HISTORY_COUNT:]]
+        feed = await client.candles_many(SYMBOLS, TIMEFRAME, count=HISTORY_COUNT)
+        for symbol, candles in feed.items():
+            if candles:
+                converted = [candle_to_lwc(c) for c in candles[-HISTORY_COUNT:]]
                 candle_store[symbol] = converted
+                print(f"[{symbol}] polled {len(converted)} candles")
                 msg = json.dumps({"symbol": symbol, "history": converted})
                 for ws in subscribers[:]:
                     try:
@@ -56,10 +54,21 @@ async def stream_symbol(client: PocketOptionAsync, symbol: str):
                     except Exception:
                         if ws in subscribers:
                             subscribers.remove(ws)
+            else:
+                print(f"[{symbol}] candles_many returned empty")
+    except Exception as e:
+        print(f"[poll] candles_many error: {e!r}")
 
-            # Broadcast the forming candle (live update)
-            if forming_candle:
-                lwc = candle_to_lwc(forming_candle)
+
+async def stream_forming(client: PocketOptionAsync, symbol: str):
+    """Keep a lightweight stream just for the forming candle."""
+    print(f"[{symbol}] starting forming-candle stream...")
+    try:
+        async for closed, forming in client.get_candles_live(
+            symbol, period=TIMEFRAME, hours=0.1, max_rows=2
+        ):
+            if forming:
+                lwc = candle_to_lwc(forming)
                 msg = json.dumps({"symbol": symbol, "candle": lwc})
                 for ws in subscribers[:]:
                     try:
@@ -67,11 +76,9 @@ async def stream_symbol(client: PocketOptionAsync, symbol: str):
                     except Exception:
                         if ws in subscribers:
                             subscribers.remove(ws)
-
-            await asyncio.sleep(0.05)
-
+            await asyncio.sleep(0.1)
     except Exception as e:
-        print(f"[{symbol}] stream error: {e!r}")
+        print(f"[{symbol}] forming stream error: {e!r}")
 
 
 @asynccontextmanager
@@ -81,8 +88,20 @@ async def lifespan(app: FastAPI):
     client = PocketOptionAsync(SSID)
     await asyncio.sleep(5)
 
-    tasks = [asyncio.create_task(stream_symbol(client, s)) for s in SYMBOLS]
-    print("[lifespan] stream tasks started")
+    # Initial poll for history
+    await poll_historical(client)
+
+    # Start forming-candle streams (not for history, only for live updates)
+    tasks = [asyncio.create_task(stream_forming(client, s)) for s in SYMBOLS]
+
+    # Periodic re-poll every 30 seconds to keep history fresh
+    async def repoll():
+        while True:
+            await asyncio.sleep(30)
+            await poll_historical(client)
+
+    tasks.append(asyncio.create_task(repoll()))
+    print("[lifespan] polling + streams started")
     yield
     for t in tasks:
         t.cancel()
