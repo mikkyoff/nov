@@ -15,60 +15,65 @@ SYMBOLS = ["EURHUF_otc", "EURUSD_otc"]
 PERIOD = 15            # 15-second candles
 N_CLOSED = 10          # last N closed candles to keep
 MIN_TICKS = 3          # drop buckets with fewer ticks
-REPOLL_SECONDS = 20    # re-poll cadence
+REPOLL_SECONDS = 20    # how often to recalculate
 
 candle_store = {s: [] for s in SYMBOLS}
 subscribers: list[WebSocket] = []
 
-
-def to_epoch(ts) -> int:
-    """Convert pandas Timestamp or ISO/epoch value to integer epoch seconds."""
-    if isinstance(ts, pd.Timestamp):
-        return int(ts.timestamp())
-    if isinstance(ts, str):
-        try:
-            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-            return int(dt.timestamp())
-        except ValueError:
-            dt = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-            return int(dt.timestamp())
-    return int(ts)
+# We will hold raw ticks in memory for resampling
+tick_store = {s: [] for s in SYMBOLS}
 
 
-async def poll_closed_candles(client: PocketOptionAsync):
-    """Poll ticks via get_candles, resample to PERIOD, keep last N closed candles."""
+async def stream_ticks(client: PocketOptionAsync, symbol: str):
+    """Continuously ingest ticks into memory."""
+    print(f"[{symbol}] started tick ingestion...")
+    try:
+        # hours=0.1 and max_rows=2 ensures we only get the live tick stream, not historical compile
+        async for closed, forming in client.get_candles_live(symbol, period=PERIOD, hours=0.1, max_rows=2):
+            # Both 'closed' and 'forming' contain price data. We want the ticks.
+            # We'll just grab the timestamp and close price.
+            if forming and "time" in forming and "close" in forming:
+                tick_store[symbol].append({
+                    "time": forming["time"],
+                    "price": float(forming["close"])
+                })
+            
+            # Keep memory bounded (max 5000 ticks per asset)
+            if len(tick_store[symbol]) > 5000:
+                tick_store[symbol] = tick_store[symbol][-5000:]
+
+            await asyncio.sleep(0.05)
+    except Exception as e:
+        print(f"[{symbol}] tick stream error: {e!r}")
+
+
+async def calculate_closed_candles():
+    """Resample stored ticks into 15s OHLC and drop the forming bucket."""
     for symbol in SYMBOLS:
+        ticks = tick_store[symbol]
+        if not ticks:
+            print(f"[{symbol}] waiting for ticks...")
+            continue
+            
         try:
-            lookback_seconds = N_CLOSED * PERIOD * 6  # generous buffer
-            rows = await client.get_candles(symbol, PERIOD, lookback_seconds)
-            if not rows:
-                print(f"[{symbol}] get_candles returned nothing")
-                continue
-
-            df = pd.DataFrame(rows)
-            df.columns = [c.strip().lower() for c in df.columns]
+            df = pd.DataFrame(ticks)
             df["time"] = pd.to_datetime(df["time"], utc=True)
             df = df.set_index("time").sort_index()
-            df["price"] = df["price"].astype(float)
-
-            rule = f"{PERIOD}s"
-            ohlc = df["price"].resample(rule, label="left", closed="left").agg(
+            
+            # Resample
+            ohlc = df["price"].resample(f"{PERIOD}s", label="left", closed="left").agg(
                 open="first", high="max", low="min", close="last", count="count"
             )
-
-            # Drop the forming bucket (its end is in the future relative to now)
+            
+            # Drop forming bucket
             now = pd.Timestamp.now(tz="UTC")
             bucket_end = ohlc.index + pd.Timedelta(seconds=PERIOD)
             ohlc = ohlc[bucket_end <= now]
-
+            
             # Drop sparse buckets
-            sparse = ohlc[ohlc["count"] < MIN_TICKS]
-            if not sparse.empty:
-                print(f"[{symbol}] dropping {len(sparse)} sparse buckets (<{MIN_TICKS} ticks)")
             ohlc = ohlc[ohlc["count"] >= MIN_TICKS]
-
             ohlc = ohlc.tail(N_CLOSED)
-
+            
             converted = []
             for ts, row in ohlc.iterrows():
                 converted.append({
@@ -78,22 +83,21 @@ async def poll_closed_candles(client: PocketOptionAsync):
                     "low": float(row["low"]),
                     "close": float(row["close"]),
                 })
-
+                
             candle_store[symbol] = converted
-            print(f"[{symbol}] {len(converted)} closed candles "
-                  f"(epoch {converted[0]['time'] if converted else '-'} "
-                  f"→ {converted[-1]['time'] if converted else '-'})")
-
-            msg = json.dumps({"symbol": symbol, "history": converted})
-            for ws in subscribers[:]:
-                try:
-                    await ws.send_text(msg)
-                except Exception:
-                    if ws in subscribers:
-                        subscribers.remove(ws)
+            
+            if converted:
+                print(f"[{symbol}] resampled {len(converted)} closed candles from {len(ticks)} ticks")
+                msg = json.dumps({"symbol": symbol, "history": converted})
+                for ws in subscribers[:]:
+                    try:
+                        await ws.send_text(msg)
+                    except Exception:
+                        if ws in subscribers:
+                            subscribers.remove(ws)
 
         except Exception as e:
-            print(f"[{symbol}] poll error: {e!r}")
+            print(f"[{symbol}] resample error: {e!r}")
 
 
 @asynccontextmanager
@@ -103,17 +107,26 @@ async def lifespan(app: FastAPI):
     client = PocketOptionAsync(SSID)
     await asyncio.sleep(5)
 
-    await poll_closed_candles(client)
+    # Start tick ingestion
+    tick_tasks = [asyncio.create_task(stream_ticks(client, s)) for s in SYMBOLS]
 
-    async def repoll():
+    # Start periodic resampling
+    async def resample_loop():
         while True:
             await asyncio.sleep(REPOLL_SECONDS)
-            await poll_closed_candles(client)
+            await calculate_closed_candles()
 
-    task = asyncio.create_task(repoll())
-    print("[lifespan] polling loop started")
+    resample_task = asyncio.create_task(resample_loop())
+    
+    # Trigger an immediate first resample just in case ticks are already buffered
+    asyncio.create_task(calculate_closed_candles())
+
+    print("[lifespan] tick ingestion and resampling loop started")
     yield
-    task.cancel()
+    
+    for t in tick_tasks:
+        t.cancel()
+    resample_task.cancel()
     print("[lifespan] shutdown")
 
 
@@ -126,16 +139,12 @@ async def health():
     for s in SYMBOLS:
         c = candle_store[s]
         detail[s] = {
-            "count": len(c),
-            "first_epoch": c[0]["time"] if c else None,
+            "ticks_buffered": len(tick_store[s]),
+            "candles_ready": len(c),
             "last_epoch": c[-1]["time"] if c else None,
             "last_close": c[-1]["close"] if c else None,
         }
-    return JSONResponse({
-        "status": "ok",
-        "symbols": detail,
-        "subscribers": len(subscribers),
-    })
+    return JSONResponse({"status": "ok", "symbols": detail})
 
 
 @app.websocket("/ws")
@@ -144,7 +153,8 @@ async def ws_endpoint(ws: WebSocket):
     subscribers.append(ws)
     try:
         for symbol, candles in candle_store.items():
-            await ws.send_text(json.dumps({"symbol": symbol, "history": candles}))
+            if candles:
+                await ws.send_text(json.dumps({"symbol": symbol, "history": candles}))
         while True:
             await ws.receive_text()
     except WebSocketDisconnect:
