@@ -5,27 +5,33 @@
   <title>PocketOption Closed Candles</title>
   <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
   <style>
-    body { margin: 0; background: #131722; font-family: sans-serif; }
-    .container { display: flex; height: 100vh; }
-    .chart-panel { flex: 1; display: flex; flex-direction: column; }
-    .chart-title { color: #d1d4dc; padding: 8px 12px; font-size: 14px; }
+    body { margin: 0; background: #131722; font-family: sans-serif; color: #d1d4dc; }
+    .header { padding: 10px; text-align: center; background: #1e222d; border-bottom: 1px solid #2a2e39; }
+    .container { display: flex; height: calc(100vh - 40px); }
+    .chart-panel { flex: 1; display: flex; flex-direction: column; position: relative; }
+    .chart-title { padding: 8px 12px; font-size: 14px; border-bottom: 1px solid #2a2e39; }
     .chart { flex: 1; }
+    .loading { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); font-size: 16px; color: #787b86; }
   </style>
 </head>
 <body>
+<div class="header" id="status">Connecting to server...</div>
 <div class="container">
   <div class="chart-panel">
     <div class="chart-title">EURHUF_otc · 15s · last 10 closed</div>
     <div id="chart1" class="chart"></div>
+    <div class="loading" id="load1">Waiting for ticks...</div>
   </div>
   <div class="chart-panel">
     <div class="chart-title">EURUSD_otc · 15s · last 10 closed</div>
     <div id="chart2" class="chart"></div>
+    <div class="loading" id="load2">Waiting for ticks...</div>
   </div>
 </div>
 <script>
   const charts = {};
   const series = {};
+  const loadingDivs = { 'EURHUF_otc': document.getElementById('load1'), 'EURUSD_otc': document.getElementById('load2') };
 
   function createChart(containerId) {
     const chart = LightweightCharts.createChart(document.getElementById(containerId), {
@@ -47,13 +53,18 @@
 
   const ws = new WebSocket(`wss://${location.host}/ws`);
 
+  ws.onopen = () => { document.getElementById('status').innerText = "Connected. Waiting for data..."; };
+  ws.onclose = () => { document.getElementById('status').innerText = "Disconnected."; };
+
   ws.onmessage = (event) => {
     const msg = JSON.parse(event.data);
     const sym = msg.symbol;
     if (!series[sym]) return;
-    if (msg.history) {
+    if (msg.history && msg.history.length > 0) {
       series[sym].setData(msg.history);
       charts[sym].timeScale().fitContent();
+      if (loadingDivs[sym]) loadingDivs[sym].style.display = 'none';
+      document.getElementById('status').innerText = "Live data received.";
     }
   };
 </script>
