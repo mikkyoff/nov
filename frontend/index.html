@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <title>PocketOption Live Candles</title>
+  <title>PocketOption Closed Candles</title>
   <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
   <style>
     body { margin: 0; background: #131722; font-family: sans-serif; }
@@ -15,11 +15,11 @@
 <body>
 <div class="container">
   <div class="chart-panel">
-    <div class="chart-title">EURHUF_otc · 15s</div>
+    <div class="chart-title">EURHUF_otc · 15s · last 10 closed</div>
     <div id="chart1" class="chart"></div>
   </div>
   <div class="chart-panel">
-    <div class="chart-title">EURUSD_otc · 15s</div>
+    <div class="chart-title">EURUSD_otc · 15s · last 10 closed</div>
     <div id="chart2" class="chart"></div>
   </div>
 </div>
@@ -51,19 +51,10 @@
     const msg = JSON.parse(event.data);
     const sym = msg.symbol;
     if (!series[sym]) return;
-
     if (msg.history) {
-      // Backfill
       series[sym].setData(msg.history);
       charts[sym].timeScale().fitContent();
-    } else if (msg.candle) {
-      // Live update: same time updates forming candle, new time appends
-      series[sym].update(msg.candle);
     }
-  };
-
-  ws.onclose = () => {
-    console.log('WS closed; reconnect manually or refresh.');
   };
 </script>
 </body>
