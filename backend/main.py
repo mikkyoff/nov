@@ -128,5 +128,42 @@ async def ws_endpoint(ws: WebSocket):
         if ws in subscribers:
             subscribers.remove(ws)
 
+import subprocess
+import httpx
 
+@app.get("/ip-info")
+async def ip_info():
+    """Checks Railway's outbound IP and ISP."""
+    try:
+        async with httpx.AsyncClient() as client_http:
+            resp = await client_http.get("https://ipinfo.io/json", timeout=10.0)
+            return JSONResponse(content=resp.json())
+    except Exception as e:
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
+@app.get("/speedtest")
+async def run_speedtest():
+    """Runs a network speed test from inside the Railway container."""
+    try:
+        result = subprocess.run(
+            ["speedtest-cli", "--json"], 
+            capture_output=True, 
+            text=True, 
+            timeout=60
+        )
+        if result.returncode != 0:
+            return JSONResponse(content={"error": "Speedtest failed", "details": result.stderr}, status_code=500)
+        
+        data = json.loads(result.stdout)
+        return JSONResponse(content={
+            "download_mbps": round(data["download"] / 1_000_000, 2),
+            "upload_mbps": round(data["upload"] / 1_000_000, 2),
+            "ping_ms": data["ping"],
+            "isp": data["client"].get("isp", "Unknown"),
+            "ip": data["client"].get("ip", "Unknown")
+        })
+    except subprocess.TimeoutExpired:
+        return JSONResponse(content={"error": "Speedtest timed out"}, status_code=504)
+    except Exception as e:
+        return JSONResponse(content={"error": str(e)}, status_code=500)
 app.mount("/", StaticFiles(directory="frontend", html=True), name="static")
