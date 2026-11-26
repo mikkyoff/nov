@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from BinaryOptionsToolsV2.pocketoption import PocketOptionAsync, SubscriptionType
+from BinaryOptionsToolsV2.pocketoption import PocketOptionAsync
 
 SSID = os.environ.get("POCKET_OPTION_SSID")
 SYMBOLS = ["EURHUF_otc", "EURUSD_otc"]
@@ -25,16 +25,14 @@ async def sync_server_time(client: PocketOptionAsync):
     """Calculate the offset between local time and PocketOption server time."""
     global server_time_offset
     try:
-        # Assuming get_server_time returns a timestamp or datetime object
         server_time = await client.get_server_time()
         if isinstance(server_time, (int, float)):
             server_ts = float(server_time)
         elif isinstance(server_time, datetime):
             server_ts = server_time.timestamp()
         else:
-            server_ts = float(str(server_time)) # Fallback if it's a string
+            server_ts = float(str(server_time))
         
-        # If server time is in milliseconds, convert to seconds
         if server_ts > 1e11:
             server_ts /= 1000.0
 
@@ -51,20 +49,17 @@ async def stream_and_build_ticks(client: PocketOptionAsync, symbol: str):
     forming_candle = None
 
     try:
-        # FIXED: Use string "None" instead of Python keyword None
-        stream = await client.subscribe(symbol, SubscriptionType("None"))
+        # FIXED: Pass "None" as a string instead of importing SubscriptionType
+        stream = await client.subscribe(symbol, "None")
         
         async for tick in stream:
-            # Get the current broker time
             now_ts = time.time() + server_time_offset
-            
-            # Calculate the start of the current 15s bucket (e.g., 10:00:15)
             bucket_start = int(now_ts // PERIOD) * PERIOD
             
-            price = float(tick["close"]) # Raw ticks use 'close' for the price
+            # Raw ticks use 'close' for the price
+            price = float(tick["close"]) 
             
             if current_bucket is None:
-                # First tick ever
                 current_bucket = bucket_start
                 forming_candle = {
                     "time": bucket_start,
@@ -72,14 +67,13 @@ async def stream_and_build_ticks(client: PocketOptionAsync, symbol: str):
                 }
             
             elif bucket_start > current_bucket:
-                # Time crossed a 15s boundary! 
-                # 1. Lock the previous candle into history
+                # Time crossed a 15s boundary! Lock the candle.
                 store = candle_store[symbol]
                 store.append(forming_candle)
                 if len(store) > N_CLOSED:
                     store.pop(0)
                 
-                # 2. Start a new forming candle
+                # Start new forming candle
                 current_bucket = bucket_start
                 forming_candle = {
                     "time": bucket_start,
@@ -92,7 +86,7 @@ async def stream_and_build_ticks(client: PocketOptionAsync, symbol: str):
                 forming_candle["low"] = min(forming_candle["low"], price)
                 forming_candle["close"] = price
 
-            # Broadcast the LIVE update (history + forming candle)
+            # Broadcast
             msg = json.dumps({
                 "symbol": symbol, 
                 "history": candle_store[symbol],
@@ -105,7 +99,6 @@ async def stream_and_build_ticks(client: PocketOptionAsync, symbol: str):
                     if ws in subscribers:
                         subscribers.remove(ws)
                         
-            # Yield to let other tasks run
             await asyncio.sleep(0.01)
 
     except Exception as e:
@@ -120,7 +113,6 @@ async def lifespan(app: FastAPI):
     client = PocketOptionAsync(SSID)
     await asyncio.sleep(5)
     
-    # Sync time before starting streams
     await sync_server_time(client)
 
     tasks = [asyncio.create_task(stream_and_build_ticks(client, s)) for s in SYMBOLS]
