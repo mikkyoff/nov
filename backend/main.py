@@ -19,13 +19,15 @@ N_CLOSED = 10          # last N closed candles to keep
 
 candle_store = {s: [] for s in SYMBOLS}
 subscribers: list[WebSocket] = []
-server_time_offset = 0.0 # Offset between local time and server time
+server_time_offset = 0.0 
 
 async def sync_server_time(client: PocketOptionAsync):
     """Calculate the offset between local time and PocketOption server time."""
     global server_time_offset
     try:
         server_time = await client.get_server_time()
+        
+        # Handle different formats returned by the API
         if isinstance(server_time, (int, float)):
             server_ts = float(server_time)
         elif isinstance(server_time, datetime):
@@ -33,12 +35,21 @@ async def sync_server_time(client: PocketOptionAsync):
         else:
             server_ts = float(str(server_time))
         
+        # If server time is in milliseconds (timestamp > 1e11), convert to seconds
         if server_ts > 1e11:
             server_ts /= 1000.0
 
         local_ts = time.time()
-        server_time_offset = server_ts - local_ts
-        print(f"[TimeSync] Offset calculated: {server_time_offset:.3f} seconds")
+        offset = server_ts - local_ts
+        
+        # Sanity check: if offset is somehow > 12 hours, ignore it (prevents chart breaking)
+        if abs(offset) > 43200:
+            print(f"[TimeSync] Ignoring unrealistic offset: {offset}s. Defaulting to 0.")
+            server_time_offset = 0.0
+        else:
+            server_time_offset = offset
+            print(f"[TimeSync] Offset calculated: {server_time_offset:.3f} seconds")
+            
     except Exception as e:
         print(f"[TimeSync] Failed to sync server time: {e}. Defaulting to local time.")
 
@@ -49,15 +60,17 @@ async def stream_and_build_ticks(client: PocketOptionAsync, symbol: str):
     forming_candle = None
 
     try:
-        # FIXED: Pass "None" as a string instead of importing SubscriptionType
-        stream = await client.subscribe(symbol, "None")
+        # Use subscribe_symbol as confirmed by the API
+        stream = await client.subscribe_symbol(symbol)
         
         async for tick in stream:
             now_ts = time.time() + server_time_offset
             bucket_start = int(now_ts // PERIOD) * PERIOD
             
-            # Raw ticks use 'close' for the price
-            price = float(tick["close"]) 
+            # Safely extract price (raw ticks use 'close' or 'price' depending on the version)
+            price = float(tick.get("close", tick.get("price", 0.0)))
+            if price == 0.0:
+                continue # Skip empty ticks
             
             if current_bucket is None:
                 current_bucket = bucket_start
@@ -67,13 +80,13 @@ async def stream_and_build_ticks(client: PocketOptionAsync, symbol: str):
                 }
             
             elif bucket_start > current_bucket:
-                # Time crossed a 15s boundary! Lock the candle.
+                # Time crossed a 15s boundary! Lock the previous candle into history.
                 store = candle_store[symbol]
                 store.append(forming_candle)
                 if len(store) > N_CLOSED:
                     store.pop(0)
                 
-                # Start new forming candle
+                # Start a new forming candle
                 current_bucket = bucket_start
                 forming_candle = {
                     "time": bucket_start,
@@ -86,7 +99,7 @@ async def stream_and_build_ticks(client: PocketOptionAsync, symbol: str):
                 forming_candle["low"] = min(forming_candle["low"], price)
                 forming_candle["close"] = price
 
-            # Broadcast
+            # Broadcast to frontend
             msg = json.dumps({
                 "symbol": symbol, 
                 "history": candle_store[symbol],
@@ -110,21 +123,30 @@ async def lifespan(app: FastAPI):
     if not SSID:
         raise RuntimeError("POCKET_OPTION_SSID environment variable is not set")
     
-    client = PocketOptionAsync(SSID)
-    await asyncio.sleep(5)
-    
-    await sync_server_time(client)
+    # Use async context manager for proper connection handling
+    async with PocketOptionAsync(SSID) as client:
+        print("[lifespan] Connected. Waiting for assets to load...")
+        
+        # Ensure the asset list is loaded before we try to subscribe
+        try:
+            await client.wait_for_assets()
+        except Exception as e:
+            print(f"[lifespan] wait_for_assets warning: {e}")
+            
+        await sync_server_time(client)
 
-    tasks = [asyncio.create_task(stream_and_build_ticks(client, s)) for s in SYMBOLS]
-    print("[lifespan] manual alignment streams started")
-    
-    yield
-    
-    for t in tasks:
-        t.cancel()
-    print("[lifespan] shutdown")
+        tasks = [asyncio.create_task(stream_and_build_ticks(client, s)) for s in SYMBOLS]
+        print("[lifespan] manual alignment streams started")
+        
+        yield
+        
+        for t in tasks:
+            t.cancel()
+        print("[lifespan] shutdown")
+
 
 app = FastAPI(lifespan=lifespan)
+
 
 @app.get("/health")
 async def health():
@@ -133,6 +155,7 @@ async def health():
         "time_offset": round(server_time_offset, 3),
         "symbols": {s: len(candle_store[s]) for s in SYMBOLS}
     })
+
 
 @app.get("/ip-info")
 async def ip_info():
@@ -143,16 +166,32 @@ async def ip_info():
     except Exception as e:
         return JSONResponse(content={"error": str(e)}, status_code=500)
 
+
 @app.get("/speedtest")
 async def run_speedtest():
     try:
-        result = subprocess.run(["speedtest-cli", "--json"], capture_output=True, text=True, timeout=60)
+        result = subprocess.run(
+            ["speedtest-cli", "--json"], 
+            capture_output=True, 
+            text=True, 
+            timeout=60
+        )
         if result.returncode != 0:
-            return JSONResponse(content={"error": "Speedtest failed"}, status_code=500)
+            return JSONResponse(content={"error": "Speedtest failed", "details": result.stderr}, status_code=500)
+        
         data = json.loads(result.stdout)
-        return JSONResponse(content={"download_mbps": round(data["download"] / 1_000_000, 2), "upload_mbps": round(data["upload"] / 1_000_000, 2)})
+        return JSONResponse(content={
+            "download_mbps": round(data["download"] / 1_000_000, 2),
+            "upload_mbps": round(data["upload"] / 1_000_000, 2),
+            "ping_ms": data["ping"],
+            "isp": data["client"].get("isp", "Unknown"),
+            "ip": data["client"].get("ip", "Unknown")
+        })
+    except subprocess.TimeoutExpired:
+        return JSONResponse(content={"error": "Speedtest timed out"}, status_code=504)
     except Exception as e:
         return JSONResponse(content={"error": str(e)}, status_code=500)
+
 
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
@@ -170,5 +209,6 @@ async def ws_endpoint(ws: WebSocket):
     except WebSocketDisconnect:
         if ws in subscribers:
             subscribers.remove(ws)
+
 
 app.mount("/", StaticFiles(directory="frontend", html=True), name="static")
