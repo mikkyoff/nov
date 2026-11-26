@@ -51,8 +51,8 @@ async def stream_and_build_ticks(client: PocketOptionAsync, symbol: str):
     forming_candle = None
 
     try:
-        # Subscribe to raw ticks (no aggregation)
-        stream = await client.subscribe(symbol, SubscriptionType.None)
+        # FIXED: Use string "None" instead of Python keyword None
+        stream = await client.subscribe(symbol, SubscriptionType("None"))
         
         async for tick in stream:
             # Get the current broker time
@@ -167,7 +167,6 @@ async def ws_endpoint(ws: WebSocket):
     await ws.accept()
     subscribers.append(ws)
     try:
-        # Send whatever we currently have
         for symbol in SYMBOLS:
             await ws.send_text(json.dumps({
                 "symbol": symbol, 
