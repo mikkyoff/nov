@@ -4,6 +4,7 @@ import os
 import subprocess
 import httpx
 import time
+import socket
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
@@ -27,7 +28,6 @@ async def sync_server_time(client: PocketOptionAsync):
     try:
         server_time = await client.get_server_time()
         
-        # Handle different formats returned by the API
         if isinstance(server_time, (int, float)):
             server_ts = float(server_time)
         elif isinstance(server_time, datetime):
@@ -35,14 +35,12 @@ async def sync_server_time(client: PocketOptionAsync):
         else:
             server_ts = float(str(server_time))
         
-        # If server time is in milliseconds (timestamp > 1e11), convert to seconds
         if server_ts > 1e11:
             server_ts /= 1000.0
 
         local_ts = time.time()
         offset = server_ts - local_ts
         
-        # Sanity check: if offset is somehow > 12 hours, ignore it (prevents chart breaking)
         if abs(offset) > 43200:
             print(f"[TimeSync] Ignoring unrealistic offset: {offset}s. Defaulting to 0.")
             server_time_offset = 0.0
@@ -60,17 +58,15 @@ async def stream_and_build_ticks(client: PocketOptionAsync, symbol: str):
     forming_candle = None
 
     try:
-        # Use subscribe_symbol as confirmed by the API
         stream = await client.subscribe_symbol(symbol)
         
         async for tick in stream:
             now_ts = time.time() + server_time_offset
             bucket_start = int(now_ts // PERIOD) * PERIOD
             
-            # Safely extract price (raw ticks use 'close' or 'price' depending on the version)
             price = float(tick.get("close", tick.get("price", 0.0)))
             if price == 0.0:
-                continue # Skip empty ticks
+                continue
             
             if current_bucket is None:
                 current_bucket = bucket_start
@@ -80,13 +76,11 @@ async def stream_and_build_ticks(client: PocketOptionAsync, symbol: str):
                 }
             
             elif bucket_start > current_bucket:
-                # Time crossed a 15s boundary! Lock the previous candle into history.
                 store = candle_store[symbol]
                 store.append(forming_candle)
                 if len(store) > N_CLOSED:
                     store.pop(0)
                 
-                # Start a new forming candle
                 current_bucket = bucket_start
                 forming_candle = {
                     "time": bucket_start,
@@ -94,12 +88,10 @@ async def stream_and_build_ticks(client: PocketOptionAsync, symbol: str):
                 }
                 
             else:
-                # Update the current forming candle
                 forming_candle["high"] = max(forming_candle["high"], price)
                 forming_candle["low"] = min(forming_candle["low"], price)
                 forming_candle["close"] = price
 
-            # Broadcast to frontend
             msg = json.dumps({
                 "symbol": symbol, 
                 "history": candle_store[symbol],
@@ -123,11 +115,9 @@ async def lifespan(app: FastAPI):
     if not SSID:
         raise RuntimeError("POCKET_OPTION_SSID environment variable is not set")
     
-    # Use async context manager for proper connection handling
     async with PocketOptionAsync(SSID) as client:
         print("[lifespan] Connected. Waiting for assets to load...")
         
-        # Ensure the asset list is loaded before we try to subscribe
         try:
             await client.wait_for_assets()
         except Exception as e:
@@ -191,6 +181,27 @@ async def run_speedtest():
         return JSONResponse(content={"error": "Speedtest timed out"}, status_code=504)
     except Exception as e:
         return JSONResponse(content={"error": str(e)}, status_code=500)
+
+
+@app.get("/ping-pocket")
+async def ping_pocket():
+    """Pings PocketOption's WebSocket servers to check latency."""
+    hosts = [
+        "api-eu.po.market",
+        "api-us-south.po.market",
+        "api-msk.po.market"
+    ]
+    results = {}
+    for host in hosts:
+        try:
+            start = time.time()
+            sock = socket.create_connection((host, 443), timeout=5)
+            end = time.time()
+            sock.close()
+            results[host] = round((end - start) * 1000, 2)
+        except Exception as e:
+            results[host] = f"Failed: {e}"
+    return JSONResponse(content=results)
 
 
 @app.websocket("/ws")
