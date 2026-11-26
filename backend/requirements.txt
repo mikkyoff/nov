@@ -1,4 +1,7 @@
 fastapi
 uvicorn[standard]
 websockets
+pandas
 BinaryOptionsToolsV2
+httpx
+speedtest-cli
