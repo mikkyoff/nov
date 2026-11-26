@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from BinaryOptionsToolsV2.pocketoption import PocketOptionAsync
+from BinaryOptionsToolsV2.pocketoption import PocketOptionAsync, PocketOption
 
 SSID = os.environ.get("POCKET_OPTION_SSID")
 SYMBOLS = ["EURHUF_otc", "EURUSD_otc"]
@@ -202,6 +202,39 @@ async def ping_pocket():
         except Exception as e:
             results[host] = f"Failed: {e}"
     return JSONResponse(content=results)
+
+
+@app.get("/test-trade")
+async def test_trade():
+    """Executes a 15s SELL trade and checks the result."""
+    if not SSID:
+        return JSONResponse(content={"error": "SSID missing"}, status_code=500)
+    
+    def _do_trade():
+        api = PocketOption(SSID)
+        time.sleep(3) # Let it connect
+        
+        print("[TradeTest] Placing 15s SELL trade...")
+        trade = api.sell(asset="EURGBP_otc", amount=1.0, time=15, check_win=False)
+        trade_id = trade['ticket']
+        print(f"[TradeTest] Trade placed: {trade_id}. Waiting 20s...")
+        
+        time.sleep(20)
+        
+        print("[TradeTest] Checking result...")
+        result = api.check_win(trade_id)
+        return result
+
+    try:
+        result = await asyncio.to_thread(_do_trade)
+        return JSONResponse(content={
+            "status": "success",
+            "result": result.get('result'),
+            "profit": result.get('profit'),
+            "full_response": result
+        })
+    except Exception as e:
+        return JSONResponse(content={"status": "error", "details": str(e)}, status_code=500)
 
 
 @app.websocket("/ws")
