@@ -2,36 +2,31 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <title>PocketOption Aligned Candles</title>
+  <title>PocketOption Manual Alignment</title>
   <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
   <style>
     body { margin: 0; background: #131722; font-family: sans-serif; color: #d1d4dc; }
     .header { padding: 10px; text-align: center; background: #1e222d; border-bottom: 1px solid #2a2e39; }
     .container { display: flex; height: calc(100vh - 40px); }
-    .chart-panel { flex: 1; display: flex; flex-direction: column; position: relative; }
+    .chart-panel { flex: 1; display: flex; flex-direction: column; }
     .chart-title { padding: 8px 12px; font-size: 14px; border-bottom: 1px solid #2a2e39; }
     .chart { flex: 1; }
-    .loading { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); font-size: 16px; color: #787b86; }
   </style>
 </head>
 <body>
 <div class="header" id="status">Connecting to server...</div>
 <div class="container">
   <div class="chart-panel">
-    <div class="chart-title">EURHUF_otc · 15s · Time-Aligned</div>
+    <div class="chart-title">EURHUF_otc · 15s · Manual Align</div>
     <div id="chart1" class="chart"></div>
-    <div class="loading" id="load1">Waiting for first candle...</div>
   </div>
   <div class="chart-panel">
-    <div class="chart-title">EURUSD_otc · 15s · Time-Aligned</div>
+    <div class="chart-title">EURUSD_otc · 15s · Manual Align</div>
     <div id="chart2" class="chart"></div>
-    <div class="loading" id="load2">Waiting for first candle...</div>
   </div>
 </div>
 <script>
-  const charts = {};
   const series = {};
-  const loadingDivs = { 'EURHUF_otc': document.getElementById('load1'), 'EURUSD_otc': document.getElementById('load2') };
 
   function createChart(containerId) {
     const chart = LightweightCharts.createChart(document.getElementById(containerId), {
@@ -48,12 +43,14 @@
 
   const c1 = createChart('chart1');
   const c2 = createChart('chart2');
-  charts['EURHUF_otc'] = c1.chart; series['EURHUF_otc'] = c1.series;
-  charts['EURUSD_otc'] = c2.chart; series['EURUSD_otc'] = c2.series;
+  series['EURHUF_otc'] = c1.series;
+  series['EURUSD_otc'] = c2.series;
+  c1.chart.timeScale().fitContent();
+  c2.chart.timeScale().fitContent();
 
   const ws = new WebSocket(`wss://${location.host}/ws`);
 
-  ws.onopen = () => { document.getElementById('status').innerText = "Connected. Waiting for aligned data..."; };
+  ws.onopen = () => { document.getElementById('status').innerText = "Connected. Streaming live ticks..."; };
   ws.onclose = () => { document.getElementById('status').innerText = "Disconnected."; };
 
   ws.onmessage = (event) => {
@@ -61,11 +58,14 @@
     const sym = msg.symbol;
     if (!series[sym]) return;
     
+    // If we have historical closed candles, set them
     if (msg.history && msg.history.length > 0) {
       series[sym].setData(msg.history);
-      charts[sym].timeScale().fitContent();
-      if (loadingDivs[sym]) loadingDivs[sym].style.display = 'none';
-      document.getElementById('status').innerText = "Receiving aligned data.";
+    }
+    
+    // If we have a forming candle, update it live
+    if (msg.forming) {
+      series[sym].update(msg.forming);
     }
   };
 </script>
